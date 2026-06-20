@@ -56,6 +56,16 @@ No external dependencies required - uses only Python standard library.
 python3 smpte2110_test.py
 ```
 
+**What happens:**
+1. Starts local UDP test server (ports 5004/5005)
+2. Validates packet structures
+3. Tests timing model
+4. Verifies A/V sync
+5. **Transmits actual UDP packets to local server**
+6. Validates received packets
+7. Shuts down server gracefully
+8. Reports results
+
 ### Run Specific Tests
 ```bash
 python3 smpte2110_test.py --test video    # ST 2110-20 video packets
