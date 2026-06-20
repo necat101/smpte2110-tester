@@ -236,6 +236,109 @@ class ST2110_30_Audio:
         return True, "Valid ST 2110-30 packet"
 
 
+class ST2110TestServer:
+    """UDP server for receiving and validating ST 2110 packets"""
+    
+    def __init__(self, host='127.0.0.1', video_port=5004, audio_port=5005):
+        self.host = host
+        self.video_port = video_port
+        self.audio_port = audio_port
+        self.video_socket = None
+        self.audio_socket = None
+        self.running = False
+        self.video_packets = []
+        self.audio_packets = []
+        self.video_thread = None
+        self.audio_thread = None
+        
+    def start(self):
+        """Start UDP listeners for video and audio"""
+        self.running = True
+        
+        # Video socket
+        self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.video_socket.bind((self.host, self.video_port))
+        self.video_socket.settimeout(0.5)
+        
+        # Audio socket
+        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.audio_socket.bind((self.host, self.audio_port))
+        self.audio_socket.settimeout(0.5)
+        
+        # Start listener threads
+        self.video_thread = threading.Thread(target=self._listen_video, daemon=True)
+        self.audio_thread = threading.Thread(target=self._listen_audio, daemon=True)
+        self.video_thread.start()
+        self.audio_thread.start()
+        
+        print(f"✓ Test server listening on {self.host}")
+        print(f"  Video: UDP port {self.video_port}")
+        print(f"  Audio: UDP port {self.audio_port}")
+    
+    def _listen_video(self):
+        """Listen for video packets"""
+        while self.running:
+            try:
+                data, addr = self.video_socket.recvfrom(65535)
+                packet = RTPPacket.unpack(data)
+                self.video_packets.append({
+                    'packet': packet,
+                    'addr': addr,
+                    'time': time.time(),
+                    'size': len(data)
+                })
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Video listener error: {e}")
+    
+    def _listen_audio(self):
+        """Listen for audio packets"""
+        while self.running:
+            try:
+                data, addr = self.audio_socket.recvfrom(65535)
+                packet = RTPPacket.unpack(data)
+                self.audio_packets.append({
+                    'packet': packet,
+                    'addr': addr,
+                    'time': time.time(),
+                    'size': len(data)
+                })
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Audio listener error: {e}")
+    
+    def stop(self):
+        """Stop server gracefully"""
+        self.running = False
+        if self.video_thread:
+            self.video_thread.join(timeout=1)
+        if self.audio_thread:
+            self.audio_thread.join(timeout=1)
+        if self.video_socket:
+            self.video_socket.close()
+        if self.audio_socket:
+            self.audio_socket.close()
+        print("✓ Test server stopped")
+    
+    def get_stats(self):
+        """Get packet statistics"""
+        return {
+            'video_packets': len(self.video_packets),
+            'audio_packets': len(self.audio_packets),
+            'video_bytes': sum(p['size'] for p in self.video_packets),
+            'audio_bytes': sum(p['size'] for p in self.audio_packets),
+        }
+    
+    def clear(self):
+        """Clear captured packets"""
+        self.video_packets.clear()
+        self.audio_packets.clear()
+
+
 class ST2110Tester:
     """Test suite for ST 2110 compliance"""
     
@@ -243,6 +346,20 @@ class ST2110Tester:
         self.video = ST2110_20_Video()
         self.audio = ST2110_30_Audio()
         self.results = []
+        self.server = None
+    
+    def start_test_server(self, host='127.0.0.1', video_port=5004, audio_port=5005):
+        """Start local test server"""
+        self.server = ST2110TestServer(host, video_port, audio_port)
+        self.server.start()
+        time.sleep(0.1)  # Let server start
+        return self.server
+    
+    def stop_test_server(self):
+        """Stop test server"""
+        if self.server:
+            self.server.stop()
+            self.server = None
     
     def test_video_packet_structure(self) -> bool:
         """Test ST 2110-20 video packet creation and validation"""
@@ -378,6 +495,88 @@ class ST2110Tester:
         self.results.append(("A/V Sync", True))
         return True
     
+    def test_network_flow(self) -> bool:
+        """Test actual UDP packet flow to local server"""
+        print("\n[TEST] Network Packet Flow")
+        print("-" * 50)
+        
+        if not self.server:
+            print("✗ No test server running - starting temporary server...")
+            self.start_test_server()
+            server_started_here = True
+        else:
+            server_started_here = False
+        
+        try:
+            # Clear previous packets
+            self.server.clear()
+            
+            # Create test packets
+            video_data = b'\x00' * 1000
+            audio_data = b'\x00' * 288
+            
+            video_packet = self.video.create_packet(
+                line_number=1,
+                offset=0,
+                video_data=video_data,
+                timestamp=int(time.time() * 90000) & 0xFFFFFFFF,
+                marker=0
+            )
+            
+            audio_packet = self.audio.create_packet(
+                audio_data,
+                int(time.time() * 48000) & 0xFFFFFFFF
+            )
+            
+            # Send packets via UDP
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
+            try:
+                # Send video packet
+                video_bytes = video_packet.pack()
+                sock.sendto(video_bytes, ('127.0.0.1', self.server.video_port))
+                
+                # Send audio packet
+                audio_bytes = audio_packet.pack()
+                sock.sendto(audio_bytes, ('127.0.0.1', self.server.audio_port))
+                
+                # Wait for packets to be received
+                time.sleep(0.2)
+                
+                stats = self.server.get_stats()
+                
+                print(f"Sent video packet: {len(video_bytes)} bytes to port {self.server.video_port}")
+                print(f"Sent audio packet: {len(audio_bytes)} bytes to port {self.server.audio_port}")
+                print(f"Received video packets: {stats['video_packets']}")
+                print(f"Received audio packets: {stats['audio_packets']}")
+                
+                success = stats['video_packets'] >= 1 and stats['audio_packets'] >= 1
+                
+                if success:
+                    print("✓ PASS - Packets transmitted and received successfully")
+                    
+                    # Validate received packets
+                    if self.server.video_packets:
+                        pkt = self.server.video_packets[0]['packet']
+                        valid, msg = self.video.validate_packet(pkt)
+                        print(f"  Video validation: {'✓' if valid else '✗'} {msg}")
+                    
+                    if self.server.audio_packets:
+                        pkt = self.server.audio_packets[0]['packet']
+                        valid, msg = self.audio.validate_packet(pkt)
+                        print(f"  Audio validation: {'✓' if valid else '✗'} {msg}")
+                else:
+                    print("✗ FAIL - Packets not received")
+                
+                self.results.append(("Network Flow", success))
+                return success
+                
+            finally:
+                sock.close()
+        finally:
+            if server_started_here:
+                self.stop_test_server()
+    
     def run_all_tests(self):
         """Run complete test suite"""
         print("=" * 60)
@@ -385,11 +584,16 @@ class ST2110Tester:
         print("Professional Media Over Managed IP Networks")
         print("=" * 60)
         
+        # Start test server for network tests
+        print("\nStarting local test server...")
+        self.start_test_server()
+        
         tests = [
             self.test_video_packet_structure,
             self.test_audio_packet_structure,
             self.test_timing_model,
             self.test_synchronization,
+            self.test_network_flow,
         ]
         
         for test in tests:
@@ -397,7 +601,13 @@ class ST2110Tester:
                 test()
             except Exception as e:
                 print(f"✗ TEST FAILED with exception: {e}")
+                import traceback
+                traceback.print_exc()
                 self.results.append((test.__name__, False))
+        
+        # Stop test server
+        self.stop_test_server()
+        
         
         # Summary
         print("\n" + "=" * 60)
